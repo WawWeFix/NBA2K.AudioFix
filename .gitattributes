@@ -1,0 +1,12 @@
+* text=auto
+*.c text eol=lf
+*.h text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.ini text eol=crlf
+CMakeLists.txt text eol=lf
+*.asi binary
+*.bin binary
+*.spc binary
+*.wav binary
+*.xwma binary
