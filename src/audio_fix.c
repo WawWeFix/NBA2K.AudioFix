@@ -151,46 +151,6 @@ typedef void (__stdcall *GetStateLegacyFn)(
 typedef HRESULT (__stdcall *SetFrequencyRatioFn)(void *, float, UINT32);
 typedef void (__stdcall *GetFrequencyRatioFn)(void *, float *);
 
-typedef enum PcmAssetKind {
-    PCM_ASSET_NONE = 0,
-    PCM_ASSET_JUKEBOX = 1,
-    PCM_ASSET_LOADING_SEQUENCE = 2,
-    PCM_ASSET_LOADING_SEQUENCE_JM = 3,
-    PCM_ASSET_MENTOR = 4,
-    PCM_ASSET_MENTOR_TS = 5,
-    PCM_ASSET_LOADING_VO = 6,
-    PCM_ASSET_LOADING_VO_PS = 7,
-    PCM_ASSET_LOADING_VO_TS = 8,
-    PCM_ASSET_LINES_CS = 9,
-    PCM_ASSET_ENV_AMB = 10,
-    PCM_ASSET_OVERLAY_AUDIO = 11,
-    PCM_ASSET_CAIRBALL = 12,
-    PCM_ASSET_AI_STREET = 13,
-    PCM_ASSET_CWD_LOOP = 14,
-    PCM_ASSET_AO_STREET = 15,
-    PCM_ASSET_AS_STREET = 16,
-    PCM_ASSET_DUNK_SFX = 17,
-    PCM_ASSET_COACHES = 18,
-    PCM_ASSET_TEAMS = 19,
-    PCM_ASSET_PLAYERS = 20,
-    PCM_ASSET_PRESS_CONF = 21,
-    PCM_ASSET_PA_PLAYERS = 22,
-    PCM_ASSET_CACHED_LINES = 23,
-    PCM_ASSET_LINES = 24,
-    PCM_ASSET_LINES_PS = 25,
-    PCM_ASSET_LINES_TS = 26,
-    PCM_ASSET_PA_LINES = 27,
-    PCM_ASSET_CWD_STR_LOOP_DUNK_CONTEST = 28,
-    PCM_ASSET_CWD_STR_LOOP_GYM = 29,
-    PCM_ASSET_CWD_STR_LOOP_INSIDE = 30,
-    PCM_ASSET_CWD_STR_SFX_DUNK_CONTEST = 31,
-    PCM_ASSET_CWD_STR_SFX_INSIDE = 32,
-    PCM_ASSET_EVENT_MUSIC = 33,
-    PCM_ASSET_LOAD_M = 34,
-    PCM_ASSET_STREAMED_CHATTER = 35,
-    PCM_ASSET_STREAMED_PLAYER_CHATTER = 36,
-} PcmAssetKind;
-
 typedef struct PcmStream PcmStream;
 typedef struct PcmBufferContext PcmBufferContext;
 typedef struct VoiceCallbackWrapper VoiceCallbackWrapper;
@@ -341,6 +301,8 @@ typedef struct TrackedVoice {
     DWORD submit_count;
     int pcm_substitute;
     int pcm_track;
+    float logical_volume;
+    float pcm_gain;
     PcmStream *pcm_stream;
     uint64_t pcm_size;
     uint64_t pcm_frames;
@@ -379,6 +341,13 @@ typedef struct TrackedVoice {
     DelayedEffectParameterState delayed_effect_parameters[
         DELAYED_MAX_EFFECT_PARAMETER_RECORDS];
 } TrackedVoice;
+
+typedef struct VoiceVolumeState {
+    void *target;
+    float logical_volume;
+    float pcm_gain;
+    int pcm_substitute;
+} VoiceVolumeState;
 
 typedef struct SubmitVtable {
     void **vtable;
@@ -774,6 +743,7 @@ static int activate_native_pcm_stream(
     void *voice, LONG selection,
     const PcmSelectionRecord *selection_record,
     void **previous_target_out, void **new_target_out);
+static void apply_active_pcm_gain(void *voice, void *target);
 static void flush_reused_native_sidecar_before_submit(
     void *voice, void *previous_target, void *new_target);
 static void switch_started_native_voice_after_submit(
@@ -2339,6 +2309,44 @@ static void *redirected_voice(void *voice) {
     return target;
 }
 
+static void snapshot_voice_volume_state(
+    void *voice, VoiceVolumeState *state) {
+    int index;
+    if (!state) return;
+    state->target = voice;
+    state->logical_volume = 1.0f;
+    state->pcm_gain = 1.0f;
+    state->pcm_substitute = 0;
+    if (!voice) return;
+    EnterCriticalSection(&g_lock);
+    for (index = 0; index < (int)ARRAYSIZE(g_voices); ++index) {
+        const TrackedVoice *tracked = &g_voices[index];
+        if (tracked->voice != voice) continue;
+        if (tracked->redirect_voice) {
+            state->target = tracked->redirect_voice;
+        }
+        state->logical_volume = tracked->logical_volume;
+        if (tracked->pcm_substitute && tracked->redirect_voice) {
+            state->pcm_gain = tracked->pcm_gain;
+            state->pcm_substitute = 1;
+        }
+        break;
+    }
+    LeaveCriticalSection(&g_lock);
+}
+
+static void store_voice_logical_volume(void *voice, float volume) {
+    int index;
+    EnterCriticalSection(&g_lock);
+    for (index = 0; index < (int)ARRAYSIZE(g_voices); ++index) {
+        if (g_voices[index].voice == voice) {
+            g_voices[index].logical_volume = volume;
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_lock);
+}
+
 /*
  * A redirected PCM sidecar is not guaranteed to share the WMA proxy's
  * concrete XAudio2 source-voice implementation.  Always dispatch a method
@@ -3039,6 +3047,7 @@ static HRESULT __stdcall hook_submit_source_buffer(
     if (route_activated) {
         flush_reused_native_sidecar_before_submit(
             voice, previous_target, new_target);
+        apply_active_pcm_gain(voice, submission_voice);
     }
     HRESULT result;
     PcmSubmitPlan pcm_plan;
@@ -3403,19 +3412,19 @@ static void __stdcall hook_get_output_filter_parameters(
 
 static HRESULT __stdcall hook_set_volume(
     void *voice, float volume, UINT32 operation_set) {
-    SetVolumeFn original = (SetVolumeFn)(uintptr_t)
-        voice_slot_for_target(
-            voice, redirected_voice(voice),
-            IXAUDIO2_VOICE_SET_VOLUME_SLOT);
+    VoiceVolumeState state;
+    SetVolumeFn original;
     HRESULT result;
-    void *target;
+    snapshot_voice_volume_state(voice, &state);
+    original = (SetVolumeFn)(uintptr_t)voice_slot_for_target(
+        voice, state.target, IXAUDIO2_VOICE_SET_VOLUME_SLOT);
     if (!original) return E_FAIL;
-    target = redirected_voice(voice);
-    result = original(target, volume, operation_set);
+    result = original(
+        state.target, volume * state.pcm_gain, operation_set);
     if (SUCCEEDED(result)) {
         void *candidates[PCM_NATIVE_SIDECAR_COUNT];
         int candidate_count = snapshot_native_sidecar_voices(
-            voice, target, candidates);
+            voice, state.target, candidates);
         int candidate_index;
         for (candidate_index = 0;
              candidate_index < candidate_count;
@@ -3433,16 +3442,23 @@ static HRESULT __stdcall hook_set_volume(
             if (FAILED(mirror_result)) {
             }
         }
+        store_voice_logical_volume(voice, volume);
     }
     return result;
 }
 
 static void __stdcall hook_get_volume(void *voice, float *volume) {
-    GetVolumeFn original = (GetVolumeFn)(uintptr_t)
-        voice_slot_for_target(
-            voice, redirected_voice(voice),
-            IXAUDIO2_VOICE_GET_VOLUME_SLOT);
-    if (original) original(redirected_voice(voice), volume);
+    VoiceVolumeState state;
+    GetVolumeFn original;
+    if (!volume) return;
+    snapshot_voice_volume_state(voice, &state);
+    if (state.pcm_substitute && state.pcm_gain != 1.0f) {
+        *volume = state.logical_volume;
+        return;
+    }
+    original = (GetVolumeFn)(uintptr_t)voice_slot_for_target(
+        voice, state.target, IXAUDIO2_VOICE_GET_VOLUME_SLOT);
+    if (original) original(state.target, volume);
 }
 
 static HRESULT __stdcall hook_set_channel_volumes(
@@ -3848,6 +3864,8 @@ static int track_voice(
             g_voices[index].samples_per_second =
                 format->samples_per_second;
             g_voices[index].submit_count = 0;
+            g_voices[index].logical_volume = 1.0f;
+            g_voices[index].pcm_gain = 1.0f;
             g_voices[index].create_engine = engine;
             g_voices[index].create_flags = create_flags;
             g_voices[index].create_maximum_frequency_ratio =
@@ -3888,6 +3906,8 @@ static int track_voice_pcm(
                 original_format->samples_per_second;
             g_voices[index].pcm_substitute = 1;
             g_voices[index].pcm_track = stream->track;
+            g_voices[index].logical_volume = 1.0f;
+            g_voices[index].pcm_gain = game_profile_pcm_gain(stream->asset);
             g_voices[index].pcm_stream = stream;
             g_voices[index].pcm_size = stream->expected_bytes;
             g_voices[index].pcm_frames =
@@ -4049,6 +4069,7 @@ static int activate_native_pcm_stream(
         tracked->redirect_voice = sidecar->voice;
         tracked->pcm_substitute = 1;
         tracked->pcm_track = track;
+        tracked->pcm_gain = game_profile_pcm_gain(asset);
         tracked->pcm_stream = stream;
         tracked->pcm_size = stream->expected_bytes;
         tracked->pcm_frames =
@@ -4090,6 +4111,20 @@ static int activate_native_pcm_stream(
     }
     if (new_target_out) *new_target_out = sidecar->voice;
     return 1;
+}
+
+static void apply_active_pcm_gain(void *voice, void *target) {
+    VoiceVolumeState state;
+    SetVolumeFn set_volume;
+    if (!voice || !target) return;
+    snapshot_voice_volume_state(voice, &state);
+    if (!state.pcm_substitute || state.target != target) return;
+    set_volume = (SetVolumeFn)(uintptr_t)voice_slot_for_target(
+        voice, target, IXAUDIO2_VOICE_SET_VOLUME_SLOT);
+    if (set_volume) {
+        set_volume(
+            target, state.logical_volume * state.pcm_gain, 0);
+    }
 }
 
 static void flush_reused_native_sidecar_before_submit(

@@ -17,7 +17,6 @@ Requires:
 Build:
 
 ```powershell
-git submodule update --init
 cmake -S . -B build -G "MinGW Makefiles" `
   -DFFMPEG_BUILD_ROOT="path/to/ffmpeg-build"
 cmake --build build --config Release
@@ -25,4 +24,4 @@ cmake --build build --config Release
 
 ## License
 
-Licensed under the [GNU GPL version 3 or later](LICENSE). FFmpeg remains under its own license.
+Licensed under the [GNU GPL v3](LICENSE). FFmpeg remains under its own license.
